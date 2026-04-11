@@ -2,8 +2,11 @@ import os
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 
-from backend.memory import init_db, save_message, get_history, get_symptoms, save_symptom, set_pending_symptom, get_pending_symptom, clear_pending_symptom
-from backend.memory import save_meal, get_meals
+from backend.memory import (init_db, save_message, get_history, get_symptoms, save_symptom, save_meal, get_meals, set_pending_symptom, get_pending_symptom,    clear_pending_symptom, create_chat, get_chats, rename_chat, delete_chat, get_chat_history)
+from backend.memory import save_user_fact, get_user_facts
+from backend.agents import memory_agent
+from backend.scheduler import schedule_weekly_report
+
 import uuid
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,15 +52,27 @@ start_scheduler()
 
 class ChatRequest(BaseModel):
     session_id: str
+    master_session_id: str = None
     message: str
 
 @app.get("/session")
 def new_session():
-    return {"session_id": str(uuid.uuid4())}
+    sid = str(uuid.uuid4())
+    return {"session_id": sid}
+
+@app.post("/activate/{session_id}")
+def activate_reports(session_id: str):
+    schedule_weekly_report(session_id)
+    return {"status": "weekly reports activated"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
     history = get_history(req.session_id)
+    facts_session = req.master_session_id or req.session_id
+    user_facts = get_user_facts(facts_session)
+    print(f"DEBUG - user_facts: {user_facts}")
+    facts_context = "\n".join(user_facts) if user_facts else "No facts yet."
+    print(f"DEBUG - facts_context: {facts_context}")
     
     SYMPTOM_KEYWORDS = ["bloating", "fatigue", "pain", "brain fog", "nausea", "diarrhea", "rash", "cramp", "headache", "tired", "fog", "stomach", "vomit", "constipat", "weak", "dizzy", "itch"]
     
@@ -82,11 +97,11 @@ def chat(req: ChatRequest):
     save_message(req.session_id, "user", req.message, intent)
 
     if intent == "meal_planning":
-        response = meal_agent.run(retriever, history, req.message)
+        response = meal_agent.run(retriever, history, req.message,facts_context)
     elif intent == "symptom_tracking":
-        response = symptom_agent.run(retriever, history, req.message, req.session_id)
+        response = symptom_agent.run(retriever, history, req.message, req.session_id, facts_context)
     elif intent == "lifestyle":
-        response = lifestyle_agent.run(retriever, history, req.message)
+        response = lifestyle_agent.run(retriever, history, req.message, facts_context)
     elif intent == "reminder":
         result = reminder_agent.run(req.message)
         if result["reminder"]:
@@ -109,8 +124,14 @@ User: {req.message}
 Response:"""
         response = llm.invoke(prompt)
 
-    save_message(req.session_id, "assistant", response, intent)
+    facts = memory_agent.extract_facts(req.message, response)
+    print(f"DEBUG - extracted facts: {facts}")
+    print(f"DEBUG - saving under session: {facts_session}")
+    for fact in facts:
+        save_user_fact(facts_session, fact)
 
+    save_message(req.session_id, "assistant", response, intent)
+    
     # If symptoms were found, append follow-up and store pending symptom
     if found_symptoms:
         symptom = found_symptoms[0]
@@ -134,11 +155,12 @@ async def ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
     try:
         while True:
-            # Check for pending reminders every 5 seconds
             await asyncio.sleep(5)
-            for msg in pop_reminders(session_id):
-                await websocket.send_json({"type": "reminder", "message": msg})
-    except WebSocketDisconnect:
+            msgs = pop_reminders(session_id)
+            if msgs:
+                for msg in msgs:
+                    await websocket.send_json({"type": "reminder", "message": msg})
+    except (WebSocketDisconnect, Exception):
         pass
 
 @app.get("/meals/{session_id}")
@@ -215,3 +237,46 @@ def export_pdf(session_id: str):
     buffer.seek(0)
     return StreamingResponse(buffer, media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=celiac_report.pdf"})
+
+@app.get("/reminders/{session_id}")
+def get_reminders(session_id: str):
+    msgs = pop_reminders(session_id)
+    return {"reminders": msgs}
+@app.post("/chats/{session_id}")
+def new_chat(session_id: str):
+    chat_id = create_chat(session_id, "New chat")
+    return {"chat_id": chat_id}
+@app.get("/chats/{session_id}")
+def list_chats(session_id: str):
+    return get_chats(session_id)
+
+@app.post("/chats/{session_id}")
+def new_chat(session_id: str):
+    chat_id = create_chat(session_id, "New chat")
+    return {"chat_id": chat_id}
+
+@app.put("/chats/{chat_id}")
+def update_chat_name(chat_id: str, body: dict):
+    rename_chat(chat_id, body.get("name", "New chat"))
+    return {"status": "ok"}
+
+@app.delete("/chats/{chat_id}")
+def remove_chat(chat_id: str):
+    delete_chat(chat_id)
+    return {"status": "ok"}
+
+@app.get("/chats/{chat_id}/history")
+def chat_history(chat_id: str):
+    return get_chat_history(chat_id)
+
+@app.delete("/reminders/{session_id}")
+def clear_reminders(session_id: str):
+    from backend.scheduler import scheduler
+    # Remove all jobs for this session
+    for job in scheduler.get_jobs():
+        if job.id.startswith(session_id):
+            job.remove()
+    return {"status": "cleared"}
+
+
+

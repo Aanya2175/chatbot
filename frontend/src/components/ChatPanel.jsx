@@ -10,7 +10,7 @@ const AGENT_COLORS = {
   general:          { bg: "#f5f5f5", color: "#555",    label: "General" },
 };
 
-export default function ChatPanel({ sessionId, api }) {
+export default function ChatPanel({ chatId,sessionId, api, onFirstMessage }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -21,8 +21,9 @@ export default function ChatPanel({ sessionId, api }) {
   }, [messages]);
 
   useEffect(() => {
-  if (!sessionId) return;
-  axios.get(`${api}/history/${sessionId}`)
+  if (!chatId) return;
+  setMessages([]);
+  axios.get(`${api}/chats/${chatId}/history`)
     .then(res => {
       if (res.data.length === 0) {
         setMessages([{
@@ -41,18 +42,20 @@ export default function ChatPanel({ sessionId, api }) {
         intent: "general"
       }]);
     });
-}, [sessionId, api]);
+}, [chatId, api]);
 
   const send = async () => {
-    if (!input.trim() || !sessionId || loading) return;
+    if (!input.trim() || !chatId || loading) return;
     const userMsg = input.trim();
+    const isFirst = messages.filter(m => m.role === "user").length === 0; 
     setInput("");
     setMessages(prev => [...prev, { role: "user", content: userMsg }]);
     setLoading(true);
 
     try {
       const res = await axios.post(`${api}/chat`, {
-        session_id: sessionId,
+        session_id: chatId,
+        master_session_id: sessionId,
         message: userMsg
       });
       setMessages(prev => [...prev, {
@@ -60,6 +63,7 @@ export default function ChatPanel({ sessionId, api }) {
         content: res.data.response,
         intent: res.data.intent
       }]);
+      if (isFirst && onFirstMessage) onFirstMessage(chatId, userMsg);
     } catch {
       setMessages(prev => [...prev, {
         role: "assistant",
